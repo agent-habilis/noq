@@ -364,4 +364,10 @@ impl PathStatsMap {
     pub(super) fn discard(&mut self, path_id: &PathId) -> PathStats {
         self.0.remove(path_id).unwrap_or_default()
     }
+
+    /// Number of paths with retained stats (leak gauge in tests).
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
 }

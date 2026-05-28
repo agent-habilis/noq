@@ -1648,6 +1648,87 @@ fn abandon_cycle() -> TestResult {
     Ok(())
 }
 
+/// Leak regression: open+abandon a path many times keeping one path always
+/// live (so PATH_ABANDON is always sendable and the path drains the happy way).
+/// Both `self.paths` (heavy `PathData`) and `self.abandoned_paths` (path ids)
+/// must stay bounded across the churn — a value that grows with the cycle count
+/// is a memory leak (matches the fleet soak's churn-proportional RSS slope).
+#[test]
+fn abandon_cycle_bounded() -> TestResult {
+    let _guard = subscribe();
+
+    let mut cfg = TransportConfig::default();
+    cfg.max_concurrent_multipath_paths(6);
+    cfg.initial_rtt(Duration::from_millis(10));
+
+    let mut pair = ConnPair::with_transport_cfg(cfg.clone(), cfg);
+    pair.drive();
+
+    const CYCLES: u16 = 40;
+
+    // One fresh remote address per cycle so no 4-tuple is ever reused.
+    let routing = pair.routes.as_basic();
+    let mut addrs_client = vec![routing.client_addr];
+    let mut addrs_server = vec![routing.server_addr];
+    for i in 1..=CYCLES {
+        let mut ca = routing.client_addr;
+        ca.set_port(ca.port() + i);
+        addrs_client.push(ca);
+        let mut sa = routing.server_addr;
+        sa.set_port(sa.port() + i);
+        addrs_server.push(sa);
+    }
+    pair.routes =
+        ManyToManyRouting::simple_symmetric(addrs_client.clone(), addrs_server.clone()).into();
+
+    // Always keep the just-opened path as the live anchor, abandon the previous.
+    let mut current_path = PathId::ZERO;
+    for cycle in 0..CYCLES {
+        let addr_idx = (cycle as usize) + 1;
+        let new_path_net = FourTuple {
+            local_ip: Some(addrs_client[addr_idx].ip()),
+            remote: addrs_server[addr_idx],
+        };
+
+        let new_path = pair.open_path(Client, new_path_net, PathStatus::Available)?;
+        pair.drive();
+        while pair.poll(Client).is_some() {}
+        while pair.poll(Server).is_some() {}
+
+        pair.close_path(Client, current_path, 0u8.into())?;
+        pair.drive();
+        while pair.poll(Client).is_some() {}
+        while pair.poll(Server).is_some() {}
+
+        current_path = new_path;
+
+        // All per-path collections. At most ~2 paths are ever live, and a
+        // drained path must leave every collection; none may grow with `cycle`.
+        let [paths, abandoned, remote_cids, local_cids, path_stats, number_spaces] =
+            pair.conn(Client).path_collection_sizes();
+        info!(
+            cycle,
+            paths, abandoned, remote_cids, local_cids, path_stats, number_spaces,
+            "post-cycle path collection sizes"
+        );
+        for (name, len) in [
+            ("paths", paths),
+            ("abandoned_paths", abandoned),
+            ("remote_cids", remote_cids),
+            ("local_cid_state", local_cids),
+            ("path_stats", path_stats),
+            ("number_spaces", number_spaces),
+        ] {
+            assert!(
+                len <= 6,
+                "cycle {cycle}: {name} grew to {len} — unbounded under path churn (leak)"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// NAT traversal round revalidates an existing path via new PATH_CHALLENGE.
 #[test]
 fn nat_traversal_revalidates_existing_path() -> TestResult {

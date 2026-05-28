@@ -1263,6 +1263,62 @@ async fn dropped_connection_cleans_up() {
     endpoint.wait_all_draining().await;
 }
 
+/// Leak regression (fleet churn): when a peer vanishes without a graceful
+/// CONNECTION_CLOSE — the gossip re-dial / NAT-flap pattern that drove the soak
+/// RSS slope — the local connection must still be fully reclaimed. The per-conn
+/// driver task holds the only remaining `ConnectionInner` ref after the handle
+/// is dropped, so if it never terminates the whole connection (~hundreds of KB)
+/// leaks for every churned peer. The weak handle must go dead within a bounded
+/// time once the idle timeout reclaims the silent connection.
+#[tokio::test(start_paused = true)]
+async fn connection_freed_after_peer_vanishes() {
+    let _guard = subscribe();
+
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+    let mut transport_config = TransportConfig::default();
+    transport_config
+        .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().unwrap()))
+        .initial_rtt(Duration::from_millis(10));
+
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint_with_config("server", transport_config.clone());
+    let client = factory.endpoint_with_config("client", transport_config);
+    let server_addr = server.local_addr().unwrap();
+
+    let (client_conn, server_conn) = tokio::join!(
+        async {
+            client
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async { server.accept().await.unwrap().await.unwrap() }
+    );
+
+    let weak = client_conn.weak_handle();
+    assert!(weak.is_alive(), "connection alive while established");
+
+    // Peer vanishes: drop the whole server so the client gets no close frame and
+    // must reclaim the connection via its idle timeout.
+    drop(server_conn);
+    drop(server);
+
+    // Drop the local handle: only the spawned driver task references the
+    // connection now. It must drive to drained and terminate.
+    drop(client_conn);
+
+    // Advance well past the idle timeout; the paused runtime polls the driver as
+    // its timers fire.
+    tokio::time::sleep(IDLE_TIMEOUT * 3).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        !weak.is_alive(),
+        "ConnectionInner leaked: driver task never terminated after peer vanished"
+    );
+}
+
 /// Test that accessing stats from `Path` works as expected.
 #[tokio::test]
 async fn path_clone_stats_after_abandon() {
