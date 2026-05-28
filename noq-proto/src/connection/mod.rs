@@ -300,14 +300,23 @@ pub struct Connection {
     /// possible to use [`Connection::local_cid_state`] to know if CIDs have been issued
     /// since they are issued asynchronously by the endpoint driver.
     max_path_id_with_cids: PathId,
-    /// The paths already abandoned
+    /// Paths that have been abandoned but not yet fully discarded.
     ///
-    /// They may still have some state left in [`Connection::paths`] or
-    /// [`Connection::local_cid_state`] since some of this has to be kept around for some
-    /// time after a path is abandoned.
-    // TODO(flub): Make this a more efficient data structure.  Like ranges of abandoned
-    //    paths.  Or a set together with a minimum.  Or something.
+    /// An abandoned path keeps some state in [`Connection::paths`] /
+    /// [`Connection::local_cid_state`] until it drains, so it stays here until
+    /// [`Connection::discard_path`] reclaims it — at which point its id is
+    /// removed (it is no longer a known path). This set is therefore bounded by
+    /// the number of concurrently-live paths, not by the lifetime abandon count.
+    /// The lifetime high-water needed to keep path ids monotonic is tracked
+    /// separately in [`Connection::max_abandoned_path_id`].
     abandoned_paths: FxHashSet<PathId>,
+    /// Greatest [`PathId`] ever abandoned (monotonic; never decreases).
+    ///
+    /// Path ids must never be reused, so [`Connection::open_path`] allocates
+    /// above this. It is kept as a scalar — rather than read off
+    /// [`Connection::abandoned_paths`] — so the set can be pruned on discard
+    /// without losing the reuse guard. `None` until the first abandon.
+    max_abandoned_path_id: Option<PathId>,
 
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
@@ -429,6 +438,7 @@ impl Connection {
             remote_max_path_id: PathId::ZERO,
             max_path_id_with_cids: PathId::ZERO,
             abandoned_paths: Default::default(),
+            max_abandoned_path_id: None,
 
             n0_nat_traversal: Default::default(),
             qlog,
@@ -567,7 +577,7 @@ impl Connection {
             return Err(PathError::ServerSideNotAllowed);
         }
 
-        let max_abandoned = self.abandoned_paths.iter().max().copied();
+        let max_abandoned = self.max_abandoned_path_id;
         let max_used = self.paths.keys().last().copied();
         let path_id = max_abandoned
             .max(max_used)
@@ -716,6 +726,7 @@ impl Connection {
             .push_back(EndpointEventInner::RetireResetToken(path_id));
 
         self.abandoned_paths.insert(path_id);
+        self.max_abandoned_path_id = self.max_abandoned_path_id.max(Some(path_id));
 
         for timer in timer::PathTimer::VALUES {
             // match for completeness
@@ -803,6 +814,23 @@ impl Connection {
     /// There is no guarantee any of these paths are open or usable.
     pub fn paths(&self) -> Vec<PathId> {
         self.paths.keys().copied().collect()
+    }
+
+    /// Sizes of the per-path collections, for leak gauging in tests.
+    ///
+    /// Order: `paths`, `abandoned_paths`, `remote_cids`, `local_cid_state`,
+    /// `path_stats`, data-space `number_spaces`. Each must stay bounded under
+    /// path churn — any value that grows with the churn count is a leak.
+    #[cfg(test)]
+    pub(crate) fn path_collection_sizes(&self) -> [usize; 6] {
+        [
+            self.paths.len(),
+            self.abandoned_paths.len(),
+            self.remote_cids.len(),
+            self.local_cid_state.len(),
+            self.path_stats.len(),
+            self.spaces[SpaceId::Data].number_spaces.len(),
+        ]
     }
 
     /// Gets the local [`PathStatus`] for a known [`PathId`]
@@ -3373,6 +3401,10 @@ impl Connection {
         self.partial_stats += path_stats;
         self.paths.remove(&path_id);
         self.spaces[SpaceId::Data].number_spaces.remove(&path_id);
+        // The id is no longer a known path; its monotonicity is preserved by
+        // `max_abandoned_path_id`, so drop it from the live set to keep it
+        // bounded by concurrent paths rather than the lifetime abandon count.
+        self.abandoned_paths.remove(&path_id);
 
         self.events.push_back(
             PathEvent::Discarded {
