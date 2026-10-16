@@ -3712,14 +3712,25 @@ impl Connection {
         self.max_pto_over_paths(space, self.paths.keys().copied())
     }
 
-    /// Like [`Self::max_pto_for_space`], over the paths that are not abandoned.
+    /// Like [`Self::max_pto_for_space`], over the paths that are not abandoned and not backup.
+    ///
+    /// A backup path carries no data, so its RTT estimate is sampled rarely and is noise. When
+    /// every open path is a backup path, all open paths count.
     fn max_pto_for_space_over_open_paths(&self, space: SpaceKind) -> Duration {
-        let open = self
-            .paths
-            .keys()
-            .copied()
-            .filter(|path_id| !self.abandoned_paths.contains(path_id));
-        self.max_pto_over_paths(space, open)
+        let open = || {
+            self.paths
+                .keys()
+                .copied()
+                .filter(|path_id| !self.abandoned_paths.contains(path_id))
+        };
+        let mut carrying = open()
+            .filter(|path_id| self.path_data(*path_id).local_status() != PathStatus::Backup)
+            .peekable();
+        if carrying.peek().is_some() {
+            self.max_pto_over_paths(space, carrying)
+        } else {
+            self.max_pto_over_paths(space, open())
+        }
     }
 
     fn max_pto_over_paths(
@@ -6613,7 +6624,8 @@ impl Connection {
     fn set_close_timer(&mut self, now: Instant) {
         // QUIC-MULTIPATH § 2.6 Connection Closure: draining for 3*PTO using the max PTO of
         // all paths. An abandoned path is skipped: it cannot carry CONNECTION_CLOSE, and
-        // its RTT is stale.
+        // its RTT is stale. So is a backup path while another path is open: it carries no data,
+        // and its RTT estimate is noise.
         let pto_max = self.max_pto_for_space_over_open_paths(self.highest_space);
         self.timers.set(
             Timer::Conn(ConnTimer::Close),
