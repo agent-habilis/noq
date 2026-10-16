@@ -3709,9 +3709,26 @@ impl Connection {
     ///
     /// See [`Connection::pto`]
     fn max_pto_for_space(&self, space: SpaceKind) -> Duration {
-        self.paths
+        self.max_pto_over_paths(space, self.paths.keys().copied())
+    }
+
+    /// Like [`Self::max_pto_for_space`], over the paths that are not abandoned.
+    fn max_pto_for_space_over_open_paths(&self, space: SpaceKind) -> Duration {
+        let open = self
+            .paths
             .keys()
-            .map(|path_id| self.pto(space, *path_id))
+            .copied()
+            .filter(|path_id| !self.abandoned_paths.contains(path_id));
+        self.max_pto_over_paths(space, open)
+    }
+
+    fn max_pto_over_paths(
+        &self,
+        space: SpaceKind,
+        paths: impl Iterator<Item = PathId>,
+    ) -> Duration {
+        paths
+            .map(|path_id| self.pto(space, path_id))
             .max()
             .unwrap_or_else(|| {
                 // No paths remain (e.g. last path was abandoned and the NoAvailablePath grace timer
@@ -6595,8 +6612,9 @@ impl Connection {
 
     fn set_close_timer(&mut self, now: Instant) {
         // QUIC-MULTIPATH § 2.6 Connection Closure: draining for 3*PTO using the max PTO of
-        // all paths.
-        let pto_max = self.max_pto_for_space(self.highest_space);
+        // all paths. An abandoned path is skipped: it cannot carry CONNECTION_CLOSE, and
+        // its RTT is stale.
+        let pto_max = self.max_pto_for_space_over_open_paths(self.highest_space);
         self.timers.set(
             Timer::Conn(ConnTimer::Close),
             now + 3 * pto_max,

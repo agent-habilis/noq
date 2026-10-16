@@ -2290,3 +2290,71 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+/// The close timer takes the max PTO of the open paths only. An abandoned path cannot
+/// carry CONNECTION_CLOSE, and its RTT is stale, so it must not stretch the drain.
+#[test]
+fn close_timer_skips_an_abandoned_path() -> TestResult {
+    let _guard = subscribe();
+    let fast = Duration::from_millis(1);
+    let slow = Duration::from_millis(500);
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_latency(fast)
+        .connect();
+
+    // Open path 1 on the fast link, then make the link slow and sample the RTT of path 1
+    // alone. Path 0 sends nothing ack-eliciting meanwhile, so its RTT stays fast.
+    let server_addr = pair.routes.public_server_addr();
+    let path1 = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    pair.routes.set_latency(slow);
+    for _ in 0..3 {
+        pair.ping_path(Client, path1)?;
+        pair.drive();
+    }
+    pair.routes.set_latency(fast);
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    let rtt_open = pair.rtt(Client, PathId::ZERO).expect("path 0 is open");
+    let rtt_abandoned = pair.rtt(Client, path1).expect("path 1 is open");
+    assert!(
+        rtt_open < 10 * fast && rtt_abandoned > 100 * rtt_open,
+        "the setup needs a fast open path and a slow abandoned one: \
+         rtt_open={rtt_open:?} rtt_abandoned={rtt_abandoned:?}"
+    );
+
+    // Abandon path 1 and close at once, while the abandoned path still drains.
+    pair.close_path(Client, path1, 0u8.into())?;
+    pair.close(Client, 0, b"done");
+    let closed_at = pair.time;
+    loop {
+        let busy = pair.step();
+        if pair.is_drained(Client) {
+            break;
+        }
+        assert!(busy, "the client never drained");
+    }
+    let drained_after = pair.time - closed_at;
+
+    assert!(
+        drained_after < 3 * rtt_abandoned,
+        "the close timer followed the abandoned path: drained after {drained_after:?}, \
+         rtt_open={rtt_open:?} rtt_abandoned={rtt_abandoned:?}"
+    );
+    // PTO = srtt + max(4 * rttvar, 1 ms) + max_ack_delay (25 ms by default), and rttvar
+    // is below srtt on a steady link.
+    let pto_open_at_most = 5 * rtt_open + Duration::from_millis(26);
+    assert!(
+        drained_after <= 3 * pto_open_at_most,
+        "the drain is longer than 3 * PTO of the open path: drained after {drained_after:?}, \
+         rtt_open={rtt_open:?}"
+    );
+    Ok(())
+}
