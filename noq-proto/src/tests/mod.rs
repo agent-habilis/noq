@@ -2,7 +2,10 @@ use std::{
     convert::TryInto,
     mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use assert_matches::assert_matches;
@@ -3555,6 +3558,66 @@ fn silently_drop_rejected_initials() {
             reason: ConnectionError::TimedOut,
         })
     );
+}
+
+/// An Initial whose packet fails its authentication check is a stray datagram, as the one that a
+/// dialer sends while it closes in the middle of a handshake. The endpoint drops it, as it drops an
+/// Initial with invalid reserved bits: the application never sees an `Incoming` that cannot be
+/// decrypted, and no connection attempt fails with a protocol violation.
+#[test]
+fn drop_initial_that_fails_authentication() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let seen = Arc::new(AtomicUsize::new(0));
+    pair.server.handle_incoming = Box::new({
+        let seen = seen.clone();
+        move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            IncomingConnectionBehavior::Accept
+        }
+    });
+
+    let _client_ch = pair.begin_connect(client_config());
+    pair.client.drive(pair.time);
+    // The last byte of the datagram is the end of the AEAD tag. Header protection samples the
+    // middle of the payload, so the header still unprotects and the reserved bits still read valid.
+    for (_, datagram) in pair.client.outbound.iter_mut() {
+        let mut corrupted = datagram.to_vec();
+        *corrupted.last_mut().unwrap() ^= 0xff;
+        *datagram = Bytes::from(corrupted);
+    }
+    pair.drive_client();
+    pair.drive_server();
+
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        0,
+        "the application was handed an Initial that fails its authentication check"
+    );
+    pair.server.assert_no_accept();
+}
+
+/// The counterpart of [`drop_initial_that_fails_authentication`]: an Initial that authenticates
+/// still reaches the application, and the connection completes.
+#[test]
+fn valid_initial_reaches_the_application() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let seen = Arc::new(AtomicUsize::new(0));
+    pair.server.handle_incoming = Box::new({
+        let seen = seen.clone();
+        move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            IncomingConnectionBehavior::Accept
+        }
+    });
+
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    pair.finish_connect(client_ch, server_ch);
+
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
 }
 
 #[test]

@@ -505,6 +505,30 @@ impl Endpoint {
             panic!("non-initial packet in handle_first_packet()");
         };
 
+        // An Initial that cannot be decrypted is a stray datagram, not a connection attempt: the
+        // keys come from the destination CID, so a packet for a connection that is gone, as the one
+        // that a closing dialer sends, reads as noise. Drop it as the reserved bits check does.
+        // Left to `accept`, it would reach the application and fail with a protocol violation.
+        let packet_number = header.number.expand(0);
+        let mut payload = packet.payload;
+        if crypto
+            .packet
+            .remote
+            .decrypt(
+                PathId::ZERO,
+                packet_number,
+                &packet.header_data,
+                &mut payload,
+            )
+            .is_err()
+        {
+            debug!(
+                packet_number,
+                "dropping connection attempt that fails authentication"
+            );
+            return None;
+        }
+
         let server_config = self.server_config.as_ref().unwrap().clone();
 
         let token = match IncomingToken::from_header(&header, &server_config, network_path.remote) {
@@ -533,7 +557,7 @@ impl Endpoint {
             packet: InitialPacket {
                 header,
                 header_data: packet.header_data,
-                payload: packet.payload,
+                payload,
             },
             rest: event.remaining,
             crypto,
@@ -547,7 +571,7 @@ impl Endpoint {
     // box err to avoid clippy::result_large_err
     pub fn accept(
         &mut self,
-        mut incoming: Incoming,
+        incoming: Incoming,
         now: Instant,
         buf: &mut Vec<u8>,
         server_config: Option<Arc<ServerConfig>>,
@@ -597,26 +621,6 @@ impl Endpoint {
                 )),
             }));
         }
-
-        if incoming
-            .crypto
-            .packet
-            .remote
-            .decrypt(
-                PathId::ZERO,
-                packet_number,
-                &incoming.packet.header_data,
-                &mut incoming.packet.payload,
-            )
-            .is_err()
-        {
-            debug!(packet_number, "failed to authenticate initial packet");
-            self.index.remove_initial(dst_cid);
-            return Err(Box::new(AcceptError {
-                cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
-                response: None,
-            }));
-        };
 
         let ch = ConnectionHandle(self.connections.vacant_key());
         let local_cid = self.new_cid(ch, PathId::ZERO);
@@ -1295,24 +1299,13 @@ impl Incoming {
         self.token.orig_dst_cid
     }
 
-    /// Decrypt the Initial packet payload
+    /// The decrypted Initial packet payload
     ///
-    /// This clones and decrypts the packet payload (~1200 bytes).
+    /// The endpoint decrypted the payload when the packet arrived, and drops a packet that does not
+    /// decrypt, so this clones the payload (~1200 bytes) and always returns `Some`.
     /// Can be used to extract information from the TLS ClientHello without completing the handshake.
     pub fn decrypt(&self) -> Option<DecryptedInitial> {
-        let packet_number = self.packet.header.number.expand(0);
-        let mut payload = self.packet.payload.clone();
-        self.crypto
-            .packet
-            .remote
-            .decrypt(
-                PathId::ZERO,
-                packet_number,
-                &self.packet.header_data,
-                &mut payload,
-            )
-            .ok()?;
-        Some(DecryptedInitial(payload.freeze()))
+        Some(DecryptedInitial(self.packet.payload.clone().freeze()))
     }
 }
 
