@@ -2426,3 +2426,95 @@ fn close_timer_skips_a_backup_path() -> TestResult {
     );
     Ok(())
 }
+
+/// Counts the WARN and ERROR events of the thread that installs it.
+struct CountsWarnings(Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::Subscriber for CountsWarnings {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() <= tracing::Level::WARN {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The idle timer of the last open path fires without a warning. Two paths carry the same idle
+/// timeout and no traffic: the first to expire is abandoned, the second is the last open path,
+/// which stays, and the connection idle timeout governs it from there.
+#[test]
+fn an_idle_timer_on_the_last_open_path_is_not_a_warning() -> TestResult {
+    let warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _guard = tracing::subscriber::set_default(CountsWarnings(Arc::clone(&warnings)));
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery();
+    builder
+        .server_transport_cfg
+        .default_path_max_idle_timeout(Some(Duration::from_secs(8)));
+    builder
+        .client_transport_cfg
+        .default_path_max_idle_timeout(Some(Duration::from_secs(8)));
+    // The connection idle timeout is off, so that only the path timers end anything here.
+    builder.server_transport_cfg.max_idle_timeout = None;
+    builder.client_transport_cfg.max_idle_timeout = None;
+    let mut pair = builder.connect();
+    let server_addr = pair.routes.public_server_addr();
+    let path1 = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    // No traffic: both idle timers expire. The first path goes, the second must stay.
+    let mut first_gone = false;
+    for _ in 0..20 {
+        pair.advance_time();
+        pair.drive();
+        while let Some(event) = pair.poll(Client) {
+            if matches!(
+                event,
+                Event::Path(PathEvent::Abandoned {
+                    id: PathId::ZERO,
+                    reason: PathAbandonReason::TimedOut
+                })
+            ) {
+                first_gone = true;
+            }
+        }
+        if first_gone {
+            break;
+        }
+    }
+    assert!(first_gone, "the first idle path was abandoned");
+    // The idle timer of the last open path fires in one of the next steps.
+    for _ in 0..10 {
+        pair.advance_time();
+        pair.drive();
+    }
+
+    assert!(
+        pair.paths(Client).contains(&path1),
+        "the last open path stays: {:?}",
+        pair.paths(Client)
+    );
+    assert!(!pair.is_closed(Client), "the connection stays open");
+    assert_eq!(
+        warnings.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the idle timer of the last open path logged a warning"
+    );
+    Ok(())
+}

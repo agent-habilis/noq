@@ -2508,10 +2508,15 @@ impl Connection {
                 Timer::PerPath(path_id, timer) => {
                     match timer {
                         PathTimer::PathIdle => {
-                            if let Err(err) =
-                                self.close_path_inner(now, path_id, PathAbandonReason::TimedOut)
-                            {
-                                warn!(?err, "failed closing path");
+                            match self.close_path_inner(now, path_id, PathAbandonReason::TimedOut) {
+                                Ok(()) => {}
+                                // The last open path stays: the connection idle timeout
+                                // governs it. The timer is still armed when the other path
+                                // goes, so this is no fault.
+                                Err(ClosePathError::LastOpenPath) => {
+                                    debug!("idle timer fired on the last open path");
+                                }
+                                Err(err) => warn!(?err, "failed closing path"),
                             }
                         }
 
