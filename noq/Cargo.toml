@@ -73,8 +73,7 @@ smol = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing =  { workspace = true }
 tokio = { workspace = true }
-# From crates.io, not by path: a consumer that takes noq from git then shares one noq-udp with netwatch.
-udp = { package = "noq-udp", version = "1.1.0", default-features = false, features = ["tracing"] }
+udp = { package = "noq-udp", path = "../noq-udp", version = "1.1.0", default-features = false, features = ["tracing"] }
 
 # Fix minimal dependencies for indirect deps
 async-global-executor = { workspace = true, optional = true }
