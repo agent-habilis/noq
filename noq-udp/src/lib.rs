@@ -124,7 +124,10 @@ pub struct RecvMeta {
     pub interface_index: Option<u32>,
     /// Kernel receive timestamp as Unix epoch
     ///
-    /// Populated on platforms: Linux, Android.
+    /// Always `None` for now: `SO_TIMESTAMPNS` is not enabled on sockets, see
+    /// <https://github.com/n0-computer/noq/issues/774>.
+    ///
+    /// Only Linux and Android can report it, once it is enabled again.
     pub timestamp: Option<Duration>,
 }
 
