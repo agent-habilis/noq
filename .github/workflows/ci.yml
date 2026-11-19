@@ -116,8 +116,11 @@ jobs:
       SCCACHE_GHA_ENABLED: "on"
     steps:
       - uses: actions/checkout@v6
+      # Pinned: nightly-2026-07-30+ fails to build std for espidf, libc has no
+      # AT_FDCWD there. Unpin once libc catches up (n0-computer/net-tools#202).
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-07-29
           components: rust-src
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Check noq for ESP32-C3
