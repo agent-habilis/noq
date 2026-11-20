@@ -48,6 +48,10 @@ pub struct UdpSocketState {
     /// Apple OS versions. Callers must verify availability before enabling.
     #[cfg(apple_fast)]
     apple_fast_path: AtomicBool,
+
+    /// Cached `SO_SNDBUF`.
+    #[cfg(apple)]
+    send_buffer_size: AtomicUsize,
 }
 
 impl UdpSocketState {
@@ -104,8 +108,9 @@ impl UdpSocketState {
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            // Forbid IPv4 fragmentation. Set even for IPv6 to account for IPv6 mapped IPv4 addresses.
-            // Set `may_fragment` to `true` if this option is not supported on the platform.
+            // Forbid IPv4 fragmentation. Set even for IPv6 to account for IPv6 mapped IPv4
+            // addresses. Set `may_fragment` to `true` if this option is not supported
+            // on the platform.
             may_fragment |= !set_socket_option_supported(
                 &*io,
                 libc::IPPROTO_IP,
@@ -130,8 +135,8 @@ impl UdpSocketState {
                 // #define UDP_GRO_CNT_MAX 64
                 //
                 // NOTE: this MUST be set to UDP_GRO_CNT_MAX to ensure that the receive buffer size
-                // (get_max_udp_payload_size() * gro_segments()) is large enough to hold the largest GRO
-                // list the kernel might potentially produce. See
+                // (get_max_udp_payload_size() * gro_segments()) is large enough to hold the largest
+                // GRO list the kernel might potentially produce. See
                 // https://github.com/quinn-rs/quinn/pull/1354.
                 gro_segments = NonZeroUsize::new(64).expect("known");
             }
@@ -182,6 +187,15 @@ impl UdpSocketState {
             )?;
         }
 
+        // Enlarge SO_SNDBUF to a safe minimum.
+        #[cfg(apple)]
+        if io
+            .send_buffer_size()
+            .is_ok_and(|cur| cur < Self::MIN_SAFE_SNDBUF)
+        {
+            let _ = io.set_send_buffer_size(Self::MIN_SAFE_SNDBUF);
+        }
+
         let now = Instant::now();
         Ok(Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
@@ -191,6 +205,8 @@ impl UdpSocketState {
             sendmsg_einval: AtomicBool::new(false),
             #[cfg(apple_fast)]
             apple_fast_path: AtomicBool::new(false),
+            #[cfg(apple)]
+            send_buffer_size: AtomicUsize::new(io.send_buffer_size().unwrap_or(usize::MAX)),
         })
     }
 
@@ -205,12 +221,13 @@ impl UdpSocketState {
     ///
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
+    #[deprecated(note = "silences I/O errors; use `UdpSocketState::try_send()` instead")]
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
         match send(self, socket.0, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-            // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
-            //   these by automatically clamping the MTUD upper bound to the interface MTU.
+            // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid these by
+            //   automatically clamping the MTUD upper bound to the interface MTU.
             Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Ok(()),
             Err(e) => {
                 log_sendmsg_error(&self.last_send_error, e, transmit);
@@ -297,9 +314,27 @@ impl UdpSocketState {
     }
 
     /// Resize the send buffer of `socket` to `bytes`
+    ///
+    /// On Apple platforms, `bytes` is silently raised to a safe minimum if smaller.
     #[inline]
     pub fn set_send_buffer_size(&self, socket: UdpSockRef<'_>, bytes: usize) -> io::Result<()> {
-        socket.0.set_send_buffer_size(bytes)
+        #[cfg(apple)]
+        let bytes = if bytes < Self::MIN_SAFE_SNDBUF {
+            crate::log::debug!(
+                "raising requested SO_SNDBUF from {bytes} to {}",
+                Self::MIN_SAFE_SNDBUF
+            );
+            Self::MIN_SAFE_SNDBUF
+        } else {
+            bytes
+        };
+        socket.0.set_send_buffer_size(bytes)?;
+        #[cfg(apple)]
+        self.send_buffer_size.store(
+            socket.0.send_buffer_size().unwrap_or(bytes),
+            Ordering::Relaxed,
+        );
+        Ok(())
     }
 
     /// Resize the receive buffer of `socket` to `bytes`
@@ -380,6 +415,28 @@ impl UdpSocketState {
         }
         f
     }
+
+    /// Smallest `SO_SNDBUF` that mitigates <https://feedbackassistant.apple.com/feedback/23671230>:
+    /// On macOS, a non-blocking SOCK_DGRAM `sendmsg`/`sendmsg_x` call with ancillary data returns
+    /// `EWOULDBLOCK` when the payload length is at or just under `SO_SNDBUF`.
+    #[cfg(apple)]
+    const MIN_SAFE_SNDBUF: usize = 65535 + cmsg::LEN;
+
+    /// Safety net returning `EMSGSIZE` for payload sizes in the bug's region.
+    #[cfg(apple)]
+    pub(crate) fn check_send_buffer_limit(
+        &self,
+        resid: usize,
+        hdr: &impl cmsg::MsgHdr,
+    ) -> io::Result<()> {
+        let needed = resid.saturating_add(hdr.control_len());
+        let sndbuf = self.send_buffer_size.load(Ordering::Relaxed);
+        if needed > sndbuf {
+            crate::log::debug!("EMSGSIZE for {needed}-byte send: exceeds SO_SNDBUF ({sndbuf})");
+            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(any(apple, target_os = "openbsd", target_os = "netbsd")))]
@@ -445,7 +502,9 @@ fn send(
 
                 // Some arguments to `sendmsg` are not supported. Switch to
                 // fallback mode and retry if we haven't already.
-                if e.raw_os_error() == Some(libc::EINVAL) && !state.sendmsg_einval() {
+                if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::EIO))
+                    && !state.sendmsg_einval()
+                {
                     state.set_sendmsg_einval();
                     prepare_msg(
                         transmit,
@@ -490,6 +549,8 @@ pub(crate) fn send_single(
         cfg!(apple) || cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd"),
         state.sendmsg_einval(),
     );
+    #[cfg(apple)]
+    state.check_send_buffer_limit(transmit.contents.len(), &hdr)?;
     retry_if_interrupted(|| unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) })?;
     Ok(())
 }
