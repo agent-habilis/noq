@@ -125,6 +125,14 @@ impl PathState {
     }
 }
 
+/// The most on-path challenges we remember while waiting for a PATH_RESPONSE.
+///
+/// A path that never validates re-sends a challenge every [`MAX_PTO_INTERVAL`] for as long as
+/// the connection lives, so the history must be bounded. 32 tokens cover 32 * 2 s = 64 s at the
+/// capped retry interval, far longer than a late but valid PATH_RESPONSE can plausibly take.
+/// Past this limit the oldest token is forgotten and a response to it is treated as unknown.
+const MAX_UNCONFIRMED_CHALLENGES: usize = 32;
+
 #[derive(Debug)]
 pub(super) struct SentChallengeInfo {
     /// When was the challenge sent on the wire.
@@ -436,6 +444,16 @@ impl PathData {
         };
         debug_assert_eq!(network_path, self.network_path);
         self.unconfirmed_challenges.insert(token, info);
+        if self.unconfirmed_challenges.len() > MAX_UNCONFIRMED_CHALLENGES {
+            let oldest = self
+                .unconfirmed_challenges
+                .iter()
+                .min_by_key(|(_, info)| info.sent_instant)
+                .map(|(token, _)| *token);
+            if let Some(oldest) = oldest {
+                self.unconfirmed_challenges.remove(&oldest);
+            }
+        }
     }
 
     /// Remove `packet` with number `pn` from this path's congestion control counters, or return
@@ -477,14 +495,22 @@ impl PathData {
         if self.unconfirmed_challenges.is_empty() {
             return None;
         }
-        let duration = self.on_path_challenge_expiry();
+        let duration = self.on_path_challenge_pto();
         self.unconfirmed_challenges
             .values()
             .map(|info| info.sent_instant + duration)
             .min()
     }
 
-    pub(super) fn on_path_challenge_expiry(&self) -> Duration {
+    /// The duration after which a PTO expires for an on-path challenge, if sent now.
+    ///
+    /// Since challenges need an on-path response rather than just an ACK that can be sent
+    /// on any path they need a different timer from the
+    /// [`PathTimer::LossDetection`]. Functionally this behaves as the probe timeout
+    /// however.
+    ///
+    /// [`PathTimer::LossDetection`]: super::timer::PathTimer::LossDetection
+    pub(super) fn on_path_challenge_pto(&self) -> Duration {
         let backoff = 2u32.pow(self.lost_challenge_count.min(MAX_BACKOFF_EXPONENT));
         let duration = self.rtt.pto_base() * backoff;
         duration.min(MAX_PTO_INTERVAL)
@@ -1099,6 +1125,13 @@ pub enum PathAbandonReason {
         error_code: VarInt,
     },
     /// We didn't receive a path response in time after opening this path.
+    ///
+    /// This event is no longer emitted, when validation fails a path is only abandoned once
+    /// there's a path timeout and the [`Self::TimedOut`] event will be emitted instead.
+    #[deprecated(
+        since = "1.1.0",
+        note = "This event is no longer emitted, TimedOut will be emitted instead"
+    )]
     ValidationFailed,
     /// We didn't receive any data from the remote within the path's idle timeout.
     TimedOut,
@@ -1121,6 +1154,7 @@ impl PathAbandonReason {
     pub(crate) fn error_code(&self) -> TransportErrorCode {
         match self {
             Self::ApplicationClosed { error_code } => (*error_code).into(),
+            #[allow(deprecated)]
             Self::ValidationFailed | Self::TimedOut | Self::UnusableAfterNetworkChange => {
                 TransportErrorCode::PATH_UNSTABLE_OR_POOR
             }
@@ -1183,5 +1217,76 @@ mod tests {
 
         // outside range saturates
         assert_eq!(PathId::MAX.saturating_add(1u8), PathId::MAX)
+    }
+
+    fn blackholed_path(now: Instant) -> PathData {
+        let remote = "192.0.2.1:4433".parse().unwrap();
+        PathData::new(
+            FourTuple::from_remote(remote),
+            false,
+            None,
+            0,
+            now,
+            &TransportConfig::default(),
+        )
+    }
+
+    fn send_challenges(path: &mut PathData, start: Instant, count: u64) {
+        for token in 0..count {
+            let sent = start + Duration::from_millis(token);
+            path.record_path_challenge_sent(sent, token, path.network_path);
+        }
+    }
+
+    #[test]
+    fn unconfirmed_challenges_are_bounded() {
+        let now = Instant::now();
+        let mut path = blackholed_path(now);
+        let total = MAX_UNCONFIRMED_CHALLENGES as u64 * 4;
+        send_challenges(&mut path, now, total);
+        assert_eq!(
+            path.unconfirmed_challenges.len(),
+            MAX_UNCONFIRMED_CHALLENGES
+        );
+    }
+
+    #[test]
+    fn response_to_retained_challenge_validates() {
+        let now = Instant::now();
+        let mut path = blackholed_path(now);
+        let total = MAX_UNCONFIRMED_CHALLENGES as u64 * 4;
+        send_challenges(&mut path, now, total);
+        let later = now + Duration::from_secs(1);
+        let newest = total - 1;
+        let oldest_retained = total - MAX_UNCONFIRMED_CHALLENGES as u64;
+        assert!(matches!(
+            path.on_path_response_received(later, oldest_retained),
+            OnPathResponseReceived::OnPath
+        ));
+        assert!(path.validated);
+        assert!(path.unconfirmed_challenges.is_empty());
+        // Validation cleared the history, the other retained tokens are unknown now.
+        assert!(matches!(
+            path.on_path_response_received(later, newest),
+            OnPathResponseReceived::Unknown
+        ));
+    }
+
+    #[test]
+    fn response_to_evicted_challenge_is_unknown() {
+        let now = Instant::now();
+        let mut path = blackholed_path(now);
+        let total = MAX_UNCONFIRMED_CHALLENGES as u64 * 4;
+        send_challenges(&mut path, now, total);
+        let evicted = total - MAX_UNCONFIRMED_CHALLENGES as u64 - 1;
+        assert!(matches!(
+            path.on_path_response_received(now, evicted),
+            OnPathResponseReceived::Unknown
+        ));
+        assert!(!path.validated);
+        assert_eq!(
+            path.unconfirmed_challenges.len(),
+            MAX_UNCONFIRMED_CHALLENGES
+        );
     }
 }

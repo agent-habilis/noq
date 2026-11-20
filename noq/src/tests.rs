@@ -61,9 +61,9 @@ fn handshake_timeout() {
     let mut roots = RootCertStore::empty();
     roots.add(cert.cert.into()).unwrap();
 
-    let mut client_config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
     const IDLE_TIMEOUT: Duration = Duration::from_millis(500);
-    let mut transport_config = crate::TransportConfig::default();
+    let mut transport_config = TransportConfig::default();
     transport_config
         .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().unwrap()))
         .initial_rtt(Duration::from_millis(10));
@@ -80,7 +80,7 @@ fn handshake_timeout() {
             .unwrap()
             .await
         {
-            Err(crate::ConnectionError::TimedOut) => {}
+            Err(ConnectionError::TimedOut) => {}
             Err(e) => panic!("unexpected error: {e:?}"),
             Ok(_) => panic!("unexpected success"),
         }
@@ -121,12 +121,43 @@ async fn close_endpoint() {
         .unwrap();
     endpoint.close(0u32.into(), &[]);
     match conn.await {
-        Err(crate::ConnectionError::LocallyClosed) => (),
+        Err(ConnectionError::LocallyClosed) => (),
         Err(e) => panic!("unexpected error: {e}"),
         Ok(_) => {
             panic!("unexpected success");
         }
     }
+}
+
+#[test]
+fn endpoint_shutdown_wakes_waiters() {
+    let runtime = rt_basic();
+    let (endpoint, _connecting) = {
+        let _guard = runtime.enter();
+        let endpoint = endpoint();
+        let connecting = endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap();
+        (endpoint, connecting)
+    };
+
+    // `wait_*` should never resolve on its own, because we never drive the connection.
+    // So it should only resolve because the endpoint driver was dropped.
+    let mut draining = pin!(endpoint.wait_all_draining());
+    let mut idle = pin!(endpoint.wait_idle());
+    let (draining_waker, draining_wakes) = new_count_waker();
+    let (idle_waker, idle_wakes) = new_count_waker();
+    let mut draining_cx = Context::from_waker(&draining_waker);
+    let mut idle_cx = Context::from_waker(&idle_waker);
+    assert!(draining.as_mut().poll(&mut draining_cx).is_pending());
+    assert!(idle.as_mut().poll(&mut idle_cx).is_pending());
+
+    drop(runtime);
+
+    assert!(draining_wakes.wakes() > 0, "draining waiter was not woken");
+    assert!(idle_wakes.wakes() > 0, "idle waiter was not woken");
+    assert!(draining.as_mut().poll(&mut draining_cx).is_ready());
+    assert!(idle.as_mut().poll(&mut idle_cx).is_ready());
 }
 
 #[test]
@@ -256,7 +287,7 @@ async fn ip_blocking() {
                 .await
                 .expect_err("server should have blocked this");
             assert!(
-                matches!(e, crate::ConnectionError::ConnectionClosed(_)),
+                matches!(e, ConnectionError::ConnectionClosed(_)),
                 "wrong error"
             );
         },
@@ -321,7 +352,7 @@ impl EndpointFactory {
             crate::ServerConfig::with_single_cert(vec![self.cert.cert.der().clone()], key).unwrap();
         server_config.transport_config(transport_config.clone());
 
-        let mut roots = rustls::RootCertStore::empty();
+        let mut roots = RootCertStore::empty();
         roots.add(self.cert.cert.der().clone()).unwrap();
         let endpoint = Endpoint::new(
             self.endpoint_config.clone(),
@@ -558,7 +589,7 @@ fn run_echo(args: EchoArgs) {
             .unwrap()
         };
 
-        let mut roots = rustls::RootCertStore::empty();
+        let mut roots = RootCertStore::empty();
         roots.add(cert).unwrap();
         let mut client_crypto =
             rustls::ClientConfig::builder_with_provider(default_provider().into())
@@ -703,7 +734,7 @@ fn subscribe() -> tracing::subscriber::DefaultGuard {
 
 struct TestWriter;
 
-impl std::io::Write for TestWriter {
+impl io::Write for TestWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         print!(
             "{}",
@@ -732,7 +763,7 @@ async fn rebind_recv() {
     let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let cert = CertificateDer::from(cert.cert);
 
-    let mut roots = rustls::RootCertStore::empty();
+    let mut roots = RootCertStore::empty();
     roots.add(cert.clone()).unwrap();
 
     let client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
@@ -1098,7 +1129,7 @@ async fn test_multipath_observed_address() {
         // TODO(@divma): this is not fixed by removing the early check of remote CIDs, at least not
         // right now. Removing the check makes poll_transmit panic somewhere. So, eval removing
         // this sleep after the poll_transmit unwraps have been addressed
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let path = conn
             .open_path(FourTuple::from_remote(server_addr), PathStatus::Available)
             .await
@@ -1860,7 +1891,7 @@ impl crate::runtime::Runtime for PanicPropagatingRuntime {
         self.tasks.lock().unwrap().spawn(future);
     }
 
-    fn wrap_udp_socket(&self, sock: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
+    fn wrap_udp_socket(&self, sock: UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
         TokioRuntime.wrap_udp_socket(sock)
     }
 
