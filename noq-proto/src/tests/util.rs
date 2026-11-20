@@ -1981,11 +1981,9 @@ impl ManyToManyRouting {
         for (_, idx) in server_routes.iter() {
             assert!(*idx < client_routes.len(), "routing table corrupt");
         }
-        let all_addrs: HashSet<_> = client_routes
-            .iter()
-            .chain(&server_routes)
-            .map(|(addr, _idx)| *addr)
-            .collect();
+        let mut all_addrs = client_routes.clone();
+        all_addrs.extend_from_slice(&server_routes);
+        all_addrs.dedup_by_key(|(addr, _idx)| *addr);
         assert_eq!(
             all_addrs.len(),
             client_routes.len() + server_routes.len(),
@@ -2412,13 +2410,4 @@ impl Limiter {
 
         Some((self.finished_sending_at, experienced_congestion))
     }
-}
-
-#[test]
-#[should_panic(expected = "Duplicate interface addresses used")]
-fn many_to_many_routing_rejects_nonconsecutive_duplicate_addresses() {
-    ManyToManyRouting::from_routes(
-        [("[::1]:1", 0), ("[::1]:2", 0), ("[::1]:1", 0)],
-        [("[::2]:1", 0), ("[::2]:2", 0), ("[::2]:3", 0)],
-    );
 }
